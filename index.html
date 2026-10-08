@@ -1,0 +1,912 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Classic Asteroids</title>
+    <style>
+        html, body {
+            height: 100%;
+        }
+        body {
+            background-color: #000;
+            color: #777;
+            margin: 0;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            font-family: 'Courier New', Courier, monospace;
+        }
+        canvas {
+            display: block;
+            background-color: #000;
+            width: min(100vw, calc((100vh - 40px) * 4 / 3));
+            aspect-ratio: 4 / 3;
+        }
+        .instructions {
+            margin-top: 10px;
+            text-align: center;
+            font-size: 13px;
+        }
+    </style>
+</head>
+<body>
+
+    <canvas id="gameCanvas" width="1024" height="768"></canvas>
+    <div class="instructions">
+        [LEFT / RIGHT] Rotate | [UP] Thrust | [SPACE] Fire | [SHIFT] Hyperspace | [ENTER] Start | [M] Sound
+    </div>
+
+<script>
+    const canvas = document.getElementById("gameCanvas");
+    const ctx = canvas.getContext("2d");
+
+    // The playfield uses the arcade's own 1024x768 vector coordinates.
+    // Speeds are in pixels per frame and timers in frames, at the arcade's 60 frames per second.
+    const W = 1024;
+    const H = 768;
+    const FRAME_MS = 1000 / 60;
+
+    // Ship (rotation, thrust, drag and top speed are the arcade ROM's values)
+    const SHIP_SCALE = 0.25;
+    const SHIP_HIT_RADIUS = 8;
+    const ROTATION_SPEED = Math.PI * 2 * 3 / 256; // 3 of 256 headings per frame
+    const THRUST = 1 / 16;
+    const FRICTION = 1 / 256;
+    const SHIP_MAX_SPEED = 63 / 8;
+    const HYPERSPACE_FRAMES = 48;
+    const RESPAWN_FRAMES = 129;
+    const START_SHIPS = 3;
+    const EXTRA_SHIP_POINTS = 10000;
+
+    // Shots
+    const SHOT_SPEED = 63 / 8;
+    const SHOT_MAX_SPEED = 111 / 8; // Per axis, after adding the shooter's velocity
+    const SHOT_LIFE = 72;
+    const SHOT_OFFSET = 12; // Shots appear just ahead of the shooter
+    const SHIP_MAX_SHOTS = 4;
+    const SAUCER_MAX_SHOTS = 2;
+
+    // Rocks: index 0 = large, 1 = medium, 2 = small
+    const ROCK_SCALE = [1, 0.5, 0.25];
+    const ROCK_HIT_RADIUS = [33, 18, 10.5];
+    const ROCK_POINTS = [20, 50, 100];
+    const ROCK_MIN_SPEED = [0.5, 0.75, 1];
+    const ROCK_MAX_SPEED = [1.5, 2.25, 3];
+    const ROCK_DEBRIS = [14, 10, 7];
+    const ROCK_LIMIT = 26;
+    const WAVE_MAX_ROCKS = 11;
+    const WAVE_DELAY = 127;
+
+    // Saucer: index 0 = large, 1 = small
+    const SAUCER_SCALE = [0.5, 0.25];
+    const SAUCER_HIT_RADIUS = [18, 9];
+    const SAUCER_POINTS = [200, 1000];
+    const SAUCER_SPEED = 2;
+    const SAUCER_FIRST_SHOT = 72;
+    const SAUCER_FIRE_FRAMES = 40;
+    const SAUCER_START_INTERVAL = 584; // Frames between saucers, shortened by each appearance
+    const SAUCER_INTERVAL_STEP = 24;
+    const SAUCER_MIN_INTERVAL = 128;
+    const SAUCER_WAVE_DELAY = 508;
+    const SAUCER_RETRY = 72;
+    const ROCK_HIT_GRACE = 320; // After a rock is shot, the saucer only comes if few rocks remain
+    const SMALL_SAUCER_ONLY = 30000;
+    const SHARP_SHOOTER = 35000; // Small saucer aim tightens from here
+
+    // --- VECTOR SHAPES ---
+    // Transcribed from the arcade's vector ROM (y flipped for canvas), as flat x,y lists
+    const ROCK_SHAPES = [
+        [0,-16, 16,-32, 32,-16, 24,0, 32,16, 8,32, -16,32, -32,16, -32,-16, -16,-32],
+        [16,-8, 32,-16, 16,-32, 0,-24, -16,-32, -32,-16, -24,0, -32,16, -16,32, -8,24, 16,32, 32,8],
+        [-16,0, -32,8, -16,32, 0,8, 0,32, 16,32, 32,8, 32,-8, 16,-32, -8,-32, -32,-8],
+        [8,0, 32,-8, 32,-16, 8,-32, -16,-32, -8,-16, -32,-16, -32,8, -16,32, 8,24, 16,32, 32,16]
+    ];
+    const SHIP_SHAPE = [-24,16, -24,-16, -40,-32, 56,0, -40,32, -24,16]; // Pointing right
+    const FLAME_SHAPE = [-24,16, -56,0, -24,-16];
+    const SAUCER_SHAPES = [
+        [-16,-8, 16,-8],
+        [40,8, -40,8, -16,24, 16,24, 40,8, 16,-8, 8,-24, -8,-24, -16,-8, -40,8]
+    ];
+
+    // Stroke font from the same ROM. Each glyph is a run of "x1 y1 x2 y2" segments on a
+    // 4x6 grid, and characters advance 6 units. Zero shares the letter O, as in the arcade.
+    const FONT_DATA = {
+        " ": "", "1": "2620", "2": "00404043430303060646", "3": "0646464040000343",
+        "4": "000303434046", "5": "06464643430303000040", "6": "0343434646060600",
+        "7": "00404046", "8": "06464640400000060343", "9": "4640400000030343",
+        "A": "06020220204242460444", "B": "0600003030414142423333033344444545363606",
+        "C": "060000400646", "D": "060000202042424444262606", "E": "0600004033030646",
+        "F": "060000403303", "G": "060000404042244444464606", "H": "060003434046",
+        "I": "064626204000", "J": "042626464640", "K": "060030030336", "L": "00060646",
+        "M": "0600002222404046", "N": "060000464640", "O": "0600004040464606",
+        "P": "0600004040434303", "Q": "060000404044442626062446", "R": "06000040404343031346",
+        "S": "06464643430303000040", "T": "26200040", "U": "000606464640", "V": "00262640",
+        "W": "0006062424464640", "X": "06400046", "Y": "262222004022", "Z": "004040060646",
+        "©": "053636656561613030010105422222242444"
+    };
+    const FONT = {};
+    for (const ch in FONT_DATA) FONT[ch] = Array.from(FONT_DATA[ch], Number);
+    FONT["0"] = FONT["O"];
+
+    // --- GAME STATE ---
+    let mode = "attract"; // attract | playing | gameover
+    let frame = 0;
+    let modeTimer = 0;
+    let score = 0;
+    let highScore = loadHighScore();
+    let ships = 0;
+    let nextExtraShip = EXTRA_SHIP_POINTS;
+
+    let ship = null;
+    let rocks = [];
+    let shots = [];
+    let saucer = null;
+    let saucerShots = [];
+    let debris = [];   // Explosion dots
+    let wreckage = []; // Pieces of a destroyed ship
+
+    let rocksPerWave = 2;
+    let waveTimer = 0;
+    let saucerInterval = SAUCER_START_INTERVAL;
+    let saucerTimer = SAUCER_WAVE_DELAY;
+    let rockHitTimer = 0;
+    let maxRocksForSaucer = 5;
+    let thumpInterval = 48;
+    let thumpTimer = 0;
+    let thumpHigh = false;
+
+    // --- CONTROLS ---
+    const keys = {};    // Keys held down
+    const pressed = {}; // Keys pressed since the last frame (fire needs a fresh press per shot)
+
+    document.addEventListener("keydown", (e) => {
+        if (["Space", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(e.code)) e.preventDefault();
+        keys[e.code] = true;
+        if (!e.repeat) pressed[e.code] = true;
+        sound.unlock();
+        if (e.code === "KeyM" && !e.repeat) sound.toggleMute();
+    });
+    document.addEventListener("keyup", (e) => { keys[e.code] = false; });
+    window.addEventListener("blur", () => { for (const k in keys) keys[k] = false; });
+    document.addEventListener("visibilitychange", () => sound.pause(document.hidden));
+
+    // --- SOUND ---
+    // All effects are synthesized; nothing plays until the first key press (browser autoplay rules)
+    const sound = {
+        ctx: null,
+        master: null,
+        noiseBuffer: null,
+        muted: false,
+        thrustGain: null,
+        thrustOn: false,
+        saucerKind: null,
+        saucerNodes: null,
+
+        unlock() {
+            if (!this.ctx) {
+                const AudioCtx = window.AudioContext || window.webkitAudioContext;
+                if (!AudioCtx) return;
+                this.ctx = new AudioCtx();
+                this.master = this.ctx.createGain();
+                this.master.gain.value = this.muted ? 0 : 0.5;
+                this.master.connect(this.ctx.destination);
+                // One second of white noise, shared by explosions and thrust
+                const rate = this.ctx.sampleRate;
+                this.noiseBuffer = this.ctx.createBuffer(1, rate, rate);
+                const data = this.noiseBuffer.getChannelData(0);
+                for (let i = 0; i < rate; i++) data[i] = Math.random() * 2 - 1;
+            }
+            if (this.ctx.state === "suspended" && !document.hidden) this.ctx.resume();
+        },
+
+        pause(hidden) {
+            if (!this.ctx) return;
+            if (hidden) this.ctx.suspend();
+            else this.ctx.resume();
+        },
+
+        toggleMute() {
+            this.muted = !this.muted;
+            if (this.master) this.master.gain.value = this.muted ? 0 : 0.5;
+        },
+
+        tone(type, from, to, duration, volume, delay = 0) {
+            if (!this.ctx) return;
+            const t = this.ctx.currentTime + delay;
+            const osc = this.ctx.createOscillator();
+            const gain = this.ctx.createGain();
+            osc.type = type;
+            osc.frequency.setValueAtTime(from, t);
+            osc.frequency.exponentialRampToValueAtTime(to, t + duration);
+            gain.gain.setValueAtTime(volume, t);
+            gain.gain.exponentialRampToValueAtTime(0.001, t + duration);
+            osc.connect(gain).connect(this.master);
+            osc.start(t);
+            osc.stop(t + duration);
+        },
+
+        noise(duration, volume, cutoff) {
+            if (!this.ctx) return;
+            const t = this.ctx.currentTime;
+            const src = this.ctx.createBufferSource();
+            const filter = this.ctx.createBiquadFilter();
+            const gain = this.ctx.createGain();
+            src.buffer = this.noiseBuffer;
+            src.loop = true;
+            filter.type = "lowpass";
+            filter.frequency.setValueAtTime(cutoff, t);
+            filter.frequency.exponentialRampToValueAtTime(cutoff / 4, t + duration);
+            gain.gain.setValueAtTime(volume, t);
+            gain.gain.exponentialRampToValueAtTime(0.001, t + duration);
+            src.connect(filter).connect(gain).connect(this.master);
+            src.start(t, Math.random() * 0.5);
+            src.stop(t + duration);
+        },
+
+        thump(high) { this.tone("square", high ? 62 : 55, high ? 58 : 51, 0.11, 0.3); },
+        fire() { this.tone("square", 1800, 240, 0.16, 0.1); },
+        saucerFire() { this.tone("square", 1100, 280, 0.2, 0.09); },
+        explosion(size) { this.noise([1, 0.7, 0.45][size], [0.9, 0.7, 0.55][size], [900, 1600, 2600][size]); },
+        extraShip() {
+            for (let i = 0; i < 14; i++) this.tone("square", 1050, 1000, 0.07, 0.08, i * 0.14);
+        },
+
+        // Continuous rumble while thrusting
+        setThrust(on) {
+            if (!this.ctx || on === this.thrustOn) return;
+            this.thrustOn = on;
+            if (!this.thrustGain) {
+                const src = this.ctx.createBufferSource();
+                const filter = this.ctx.createBiquadFilter();
+                this.thrustGain = this.ctx.createGain();
+                src.buffer = this.noiseBuffer;
+                src.loop = true;
+                filter.type = "lowpass";
+                filter.frequency.value = 350;
+                this.thrustGain.gain.value = 0;
+                src.connect(filter).connect(this.thrustGain).connect(this.master);
+                src.start();
+            }
+            this.thrustGain.gain.setTargetAtTime(on ? 0.6 : 0, this.ctx.currentTime, 0.03);
+        },
+
+        // Warbling siren while a saucer is on screen: lower and slower for the large one
+        setSaucer(kind) {
+            if (!this.ctx || kind === this.saucerKind) return;
+            this.saucerKind = kind;
+            if (this.saucerNodes) {
+                this.saucerNodes.forEach(node => node.stop());
+                this.saucerNodes = null;
+            }
+            if (!kind) return;
+            const small = kind === "small";
+            const osc = this.ctx.createOscillator();
+            const lfo = this.ctx.createOscillator();
+            const depth = this.ctx.createGain();
+            const gain = this.ctx.createGain();
+            osc.type = "square";
+            osc.frequency.value = small ? 900 : 380;
+            lfo.frequency.value = small ? 9 : 5;
+            depth.gain.value = small ? 120 : 60;
+            gain.gain.value = 0.05;
+            lfo.connect(depth).connect(osc.frequency);
+            osc.connect(gain).connect(this.master);
+            osc.start();
+            lfo.start();
+            this.saucerNodes = [osc, lfo];
+        }
+    };
+
+    // Sound effects only play during a game; attract mode is silent, as in the arcade
+    function sfx(name, arg) {
+        if (mode === "playing") sound[name](arg);
+    }
+
+    // --- HELPERS ---
+    function rand(min, max) {
+        return min + Math.random() * (max - min);
+    }
+
+    function randInt(n) {
+        return Math.floor(Math.random() * n);
+    }
+
+    function clamp(v, max) {
+        return Math.max(-max, Math.min(max, v));
+    }
+
+    function distBetween(a, b) {
+        return Math.hypot(a.x - b.x, a.y - b.y);
+    }
+
+    function wrap(obj) {
+        obj.x = (obj.x + W) % W;
+        obj.y = (obj.y + H) % H;
+    }
+
+    // Shots move up to 14 pixels a frame, so test the path they covered, not just where they landed
+    function shotHits(shot, cx, cy, r) {
+        const x1 = shot.x - shot.vx, y1 = shot.y - shot.vy;
+        const len2 = shot.vx * shot.vx + shot.vy * shot.vy || 1;
+        const t = Math.max(0, Math.min(1, ((cx - x1) * shot.vx + (cy - y1) * shot.vy) / len2));
+        return Math.hypot(cx - x1 - t * shot.vx, cy - y1 - t * shot.vy) < r;
+    }
+
+    function loadHighScore() {
+        try {
+            return Number(localStorage.getItem("asteroidsHighScore")) || 0;
+        } catch (e) {
+            return 0;
+        }
+    }
+
+    function saveHighScore() {
+        try {
+            localStorage.setItem("asteroidsHighScore", highScore);
+        } catch (e) {
+            // Storage unavailable (e.g. private browsing); the high score just won't persist
+        }
+    }
+
+    // --- GAME FLOW ---
+    function startGame() {
+        mode = "playing";
+        modeTimer = 0;
+        score = 0;
+        ships = START_SHIPS;
+        nextExtraShip = EXTRA_SHIP_POINTS;
+        rocks = [];
+        shots = [];
+        saucerShots = [];
+        saucer = null;
+        debris = [];
+        wreckage = [];
+        rocksPerWave = 2;
+        maxRocksForSaucer = 5;
+        saucerInterval = SAUCER_START_INTERVAL;
+        rockHitTimer = 0;
+        waveTimer = 0;
+        spawnWave();
+        // "PLAYER 1" shows before the first ship appears
+        ship = createShip();
+        ship.state = "dead";
+        ship.timer = 120;
+    }
+
+    function endGame() {
+        mode = "gameover";
+        modeTimer = 0;
+        ship = null;
+        if (score > highScore) {
+            highScore = score;
+            saveHighScore();
+        }
+    }
+
+    function addScore(points) {
+        if (mode !== "playing") return;
+        score += points;
+        if (score >= nextExtraShip) {
+            ships++;
+            nextExtraShip += EXTRA_SHIP_POINTS;
+            sfx("extraShip");
+        }
+    }
+
+    function spawnWave() {
+        rocksPerWave = Math.min(rocksPerWave + 2, WAVE_MAX_ROCKS);
+        maxRocksForSaucer = Math.min(maxRocksForSaucer + 1, 10);
+        for (let i = 0; i < rocksPerWave; i++) {
+            // New rocks drift in from a screen edge
+            const fromSide = Math.random() < 0.5;
+            rocks.push(createRock(fromSide ? 0 : rand(0, W), fromSide ? rand(0, H) : 0, 0));
+        }
+        saucerTimer = SAUCER_WAVE_DELAY;
+        thumpInterval = 48;
+    }
+
+    // The next wave waits until the last rock is gone and any saucer has left
+    function updateWaves() {
+        if (rocks.length > 0 || saucer) return;
+        if (waveTimer === 0) waveTimer = WAVE_DELAY;
+        if (--waveTimer === 0) spawnWave();
+    }
+
+    // Two-note heartbeat that quickens as the wave goes on
+    function updateHeartbeat() {
+        if (frame % 64 === 0 && thumpInterval > 8) thumpInterval--;
+        if (mode !== "playing" || ship.state !== "alive" || rocks.length === 0) return;
+        if (--thumpTimer <= 0) {
+            thumpTimer = thumpInterval;
+            thumpHigh = !thumpHigh;
+            sfx("thump", thumpHigh);
+        }
+    }
+
+    // --- SHIP ---
+    function createShip() {
+        return {
+            x: W / 2,
+            y: H / 2,
+            vx: 0,
+            vy: 0,
+            a: -Math.PI / 2, // Facing up
+            thrusting: false,
+            state: "alive", // alive | hyperspace | dead
+            timer: 0,
+            hyperFail: false
+        };
+    }
+
+    function updateShip() {
+        if (ship.state === "alive") {
+            if (keys["ArrowLeft"] || keys["KeyA"]) ship.a -= ROTATION_SPEED;
+            if (keys["ArrowRight"] || keys["KeyD"]) ship.a += ROTATION_SPEED;
+
+            ship.thrusting = !!(keys["ArrowUp"] || keys["KeyW"]);
+            if (ship.thrusting) {
+                ship.vx += THRUST * Math.cos(ship.a);
+                ship.vy += THRUST * Math.sin(ship.a);
+                const speed = Math.hypot(ship.vx, ship.vy);
+                if (speed > SHIP_MAX_SPEED) {
+                    ship.vx *= SHIP_MAX_SPEED / speed;
+                    ship.vy *= SHIP_MAX_SPEED / speed;
+                }
+            } else {
+                ship.vx -= ship.vx * FRICTION;
+                ship.vy -= ship.vy * FRICTION;
+            }
+            ship.x += ship.vx;
+            ship.y += ship.vy;
+            wrap(ship);
+
+            if (pressed["Space"] && fireShot(shots, SHIP_MAX_SHOTS, ship, ship.a)) sfx("fire");
+            if (pressed["ShiftLeft"] || pressed["ShiftRight"]) enterHyperspace();
+        } else if (--ship.timer <= 0) {
+            if (ship.state === "hyperspace") {
+                ship.state = "alive";
+                if (ship.hyperFail) destroyShip();
+            } else if (ships === 0) {
+                endGame();
+            } else if (spawnAreaClear()) {
+                Object.assign(ship, createShip());
+            }
+        }
+    }
+
+    function enterHyperspace() {
+        ship.state = "hyperspace";
+        ship.timer = HYPERSPACE_FRAMES;
+        ship.thrusting = false;
+        ship.vx = 0;
+        ship.vy = 0;
+        ship.x = rand(W * 3 / 32, W * 29 / 32);
+        ship.y = rand(H * 3 / 24, H * 21 / 24);
+        // The arcade's rule: a 1-in-4 roll destroys the ship on arrival, unless the screen is crowded with rocks
+        ship.hyperFail = randInt(32) >= 24 && randInt(8) * 2 + 4 >= rocks.length;
+    }
+
+    function destroyShip() {
+        shatterShip();
+        explode(ship.x, ship.y, 12);
+        sfx("explosion", 0);
+        ship.state = "dead";
+        ship.timer = RESPAWN_FRAMES;
+        ship.thrusting = false;
+        ships--;
+    }
+
+    // A new ship only appears once the middle of the screen is safe
+    function spawnAreaClear() {
+        const center = { x: W / 2, y: H / 2 };
+        return rocks.every(r => distBetween(r, center) > ROCK_HIT_RADIUS[r.size] + 90) &&
+            !(saucer && distBetween(saucer, center) < 150);
+    }
+
+    // --- SHOTS ---
+    function fireShot(list, max, shooter, angle) {
+        if (list.length >= max) return false;
+        const cos = Math.cos(angle), sin = Math.sin(angle);
+        list.push({
+            x: shooter.x + cos * SHOT_OFFSET,
+            y: shooter.y + sin * SHOT_OFFSET,
+            vx: clamp(cos * SHOT_SPEED + shooter.vx, SHOT_MAX_SPEED),
+            vy: clamp(sin * SHOT_SPEED + shooter.vy, SHOT_MAX_SPEED),
+            life: SHOT_LIFE
+        });
+        return true;
+    }
+
+    function updateShots(list) {
+        for (let i = list.length - 1; i >= 0; i--) {
+            const s = list[i];
+            s.x += s.vx;
+            s.y += s.vy;
+            wrap(s);
+            if (--s.life <= 0) list.splice(i, 1);
+        }
+    }
+
+    // --- ROCKS ---
+    function createRock(x, y, size) {
+        const angle = Math.random() * Math.PI * 2;
+        const speed = rand(ROCK_MIN_SPEED[size], ROCK_MAX_SPEED[size]);
+        return {
+            x: x,
+            y: y,
+            vx: Math.cos(angle) * speed,
+            vy: Math.sin(angle) * speed,
+            size: size,
+            shape: randInt(ROCK_SHAPES.length)
+        };
+    }
+
+    function destroyRock(index, byPlayer) {
+        const r = rocks[index];
+        rocks.splice(index, 1);
+        if (byPlayer) addScore(ROCK_POINTS[r.size]);
+        rockHitTimer = ROCK_HIT_GRACE;
+        explode(r.x, r.y, ROCK_DEBRIS[r.size]);
+        sfx("explosion", r.size);
+        // Large and medium rocks split in two, up to the arcade's on-screen limit
+        if (r.size < 2) {
+            for (let i = 0; i < 2 && rocks.length < ROCK_LIMIT; i++) {
+                rocks.push(createRock(r.x, r.y, r.size + 1));
+            }
+        }
+    }
+
+    // --- SAUCER ---
+    function updateSaucer() {
+        if (!saucer) {
+            // The countdown only runs while the player's ship is on screen
+            if (mode === "playing" && ship.state !== "alive") return;
+            if (rockHitTimer > 0) rockHitTimer--;
+            if (--saucerTimer > 0) return;
+            saucerTimer = SAUCER_RETRY;
+            // While the player is busy shooting rocks, the saucer waits until only a few remain
+            if (rockHitTimer > 0 && (rocks.length === 0 || rocks.length >= maxRocksForSaucer)) return;
+            spawnSaucer();
+            return;
+        }
+
+        // Every couple of seconds pick a new heading: level, or diagonally up or down
+        if (frame % 128 === 0) saucer.vy = [-SAUCER_SPEED, 0, 0, SAUCER_SPEED][randInt(4)];
+        saucer.x += saucer.vx;
+        saucer.y = (saucer.y + saucer.vy + H) % H;
+        if (saucer.x < 0 || saucer.x > W) {
+            removeSaucer(); // Flew off the far side
+            return;
+        }
+
+        // Saucers hold their fire while the player's ship is away
+        if (mode === "playing" && ship.state !== "alive") return;
+        if (--saucer.fireTimer > 0) return;
+        saucer.fireTimer = SAUCER_FIRE_FRAMES;
+        if (fireShot(saucerShots, SAUCER_MAX_SHOTS, saucer, saucerAim())) sfx("saucerFire");
+    }
+
+    function spawnSaucer() {
+        saucerInterval = Math.max(saucerInterval - SAUCER_INTERVAL_STEP, SAUCER_MIN_INTERVAL);
+        const fromLeft = Math.random() < 0.5;
+        saucer = {
+            x: fromLeft ? 0 : W,
+            y: rand(0, H),
+            vx: fromLeft ? SAUCER_SPEED : -SAUCER_SPEED,
+            vy: 0,
+            small: chooseSmallSaucer(),
+            fireTimer: SAUCER_FIRST_SHOT
+        };
+    }
+
+    // The arcade's odds: the first few saucers are large, then small ones grow more likely as
+    // the interval between saucers shrinks, and from 30,000 points every saucer is small
+    function chooseSmallSaucer() {
+        const ticks = saucerInterval / 4; // The arcade counts this in 4-frame ticks
+        if (ticks >= 128) return false;
+        if (score >= SMALL_SAUCER_ONLY) return true;
+        return randInt(256) > ticks / 2;
+    }
+
+    // Large saucers fire at random. Small ones aim at the ship (allowing for their own drift)
+    // with an error of up to 16 of 256 headings, tightening to 8 at high scores.
+    function saucerAim() {
+        if (!saucer.small || !ship || ship.state !== "alive") return Math.random() * Math.PI * 2;
+        const flightTime = distBetween(ship, saucer) / SHOT_SPEED;
+        const aim = Math.atan2(ship.y - saucer.y - saucer.vy * flightTime, ship.x - saucer.x - saucer.vx * flightTime);
+        const spread = score >= SHARP_SHOOTER ? 8 : 16;
+        return aim + (randInt(spread * 2) - spread) * Math.PI * 2 / 256;
+    }
+
+    function destroySaucer(byPlayer) {
+        if (byPlayer) addScore(SAUCER_POINTS[saucer.small ? 1 : 0]);
+        explode(saucer.x, saucer.y, 14);
+        sfx("explosion", 0);
+        removeSaucer();
+    }
+
+    function removeSaucer() {
+        saucer = null;
+        saucerTimer = saucerInterval;
+    }
+
+    function saucerRadius() {
+        return SAUCER_HIT_RADIUS[saucer.small ? 1 : 0];
+    }
+
+    // --- EXPLOSIONS ---
+    function explode(x, y, count) {
+        for (let i = 0; i < count; i++) {
+            const angle = Math.random() * Math.PI * 2;
+            const speed = rand(0.3, 2);
+            debris.push({ x: x, y: y, vx: Math.cos(angle) * speed, vy: Math.sin(angle) * speed, life: 25 + randInt(20) });
+        }
+    }
+
+    // Each line of the ship's hull drifts away on its own, spinning slowly
+    function shatterShip() {
+        const cos = Math.cos(ship.a) * SHIP_SCALE, sin = Math.sin(ship.a) * SHIP_SCALE;
+        for (let i = 0; i < SHIP_SHAPE.length - 2; i += 2) {
+            const x1 = SHIP_SHAPE[i] * cos - SHIP_SHAPE[i + 1] * sin;
+            const y1 = SHIP_SHAPE[i] * sin + SHIP_SHAPE[i + 1] * cos;
+            const x2 = SHIP_SHAPE[i + 2] * cos - SHIP_SHAPE[i + 3] * sin;
+            const y2 = SHIP_SHAPE[i + 2] * sin + SHIP_SHAPE[i + 3] * cos;
+            const angle = Math.atan2(y1 + y2, x1 + x2) + rand(-0.5, 0.5);
+            const speed = rand(0.3, 1.2);
+            wreckage.push({
+                x: ship.x + (x1 + x2) / 2,
+                y: ship.y + (y1 + y2) / 2,
+                hx: (x2 - x1) / 2,
+                hy: (y2 - y1) / 2,
+                a: 0,
+                spin: rand(-0.06, 0.06),
+                vx: ship.vx * 0.3 + Math.cos(angle) * speed,
+                vy: ship.vy * 0.3 + Math.sin(angle) * speed,
+                life: 90 + randInt(30)
+            });
+        }
+    }
+
+    function updateExplosions() {
+        for (let i = debris.length - 1; i >= 0; i--) {
+            const d = debris[i];
+            d.x += d.vx;
+            d.y += d.vy;
+            if (--d.life <= 0) debris.splice(i, 1);
+        }
+        for (let i = wreckage.length - 1; i >= 0; i--) {
+            const p = wreckage[i];
+            p.x += p.vx;
+            p.y += p.vy;
+            p.a += p.spin;
+            if (--p.life <= 0) wreckage.splice(i, 1);
+        }
+    }
+
+    // --- COLLISIONS ---
+    function checkCollisions() {
+        // Shots against rocks; only the player's shots score
+        for (const list of [shots, saucerShots]) {
+            for (let i = list.length - 1; i >= 0; i--) {
+                const hit = rocks.findIndex(r => shotHits(list[i], r.x, r.y, ROCK_HIT_RADIUS[r.size]));
+                if (hit >= 0) {
+                    list.splice(i, 1);
+                    destroyRock(hit, list === shots);
+                }
+            }
+        }
+
+        // Player shots against the saucer
+        if (saucer) {
+            const hit = shots.findIndex(s => shotHits(s, saucer.x, saucer.y, saucerRadius()));
+            if (hit >= 0) {
+                shots.splice(hit, 1);
+                destroySaucer(true);
+            }
+        }
+
+        // Saucer against rocks
+        if (saucer) {
+            const hit = rocks.findIndex(r => distBetween(r, saucer) < ROCK_HIT_RADIUS[r.size] + saucerRadius());
+            if (hit >= 0) {
+                destroyRock(hit, false);
+                destroySaucer(false);
+            }
+        }
+
+        if (!ship || ship.state !== "alive") return;
+
+        // Ship against rocks: as in the arcade, ramming a rock still scores it
+        const rockHit = rocks.findIndex(r => distBetween(r, ship) < ROCK_HIT_RADIUS[r.size] + SHIP_HIT_RADIUS);
+        if (rockHit >= 0) {
+            destroyRock(rockHit, true);
+            destroyShip();
+            return;
+        }
+
+        // Ship against saucer
+        if (saucer && distBetween(saucer, ship) < saucerRadius() + SHIP_HIT_RADIUS) {
+            destroySaucer(true);
+            destroyShip();
+            return;
+        }
+
+        // Saucer shots against ship
+        const shotHit = saucerShots.findIndex(s => shotHits(s, ship.x, ship.y, SHIP_HIT_RADIUS));
+        if (shotHit >= 0) {
+            saucerShots.splice(shotHit, 1);
+            destroyShip();
+        }
+    }
+
+    // --- GAME LOOP ---
+    function step() {
+        frame++;
+        modeTimer++;
+        if (mode === "attract" && (pressed["Enter"] || pressed["Space"])) {
+            startGame();
+        } else if (mode === "gameover" && modeTimer > 180) {
+            mode = "attract";
+        }
+
+        if (ship) updateShip();
+        updateShots(shots);
+        updateShots(saucerShots);
+        updateSaucer();
+        for (const r of rocks) {
+            r.x += r.vx;
+            r.y += r.vy;
+            wrap(r);
+        }
+        updateExplosions();
+        checkCollisions();
+        updateWaves();
+        updateHeartbeat();
+
+        sound.setThrust(mode === "playing" && !!ship && ship.thrusting);
+        sound.setSaucer(mode === "playing" && saucer ? (saucer.small ? "small" : "large") : null);
+
+        for (const k in pressed) delete pressed[k];
+    }
+
+    // --- RENDERING ---
+    let view = 1; // Canvas pixels per playfield unit
+
+    function resize() {
+        const rect = canvas.getBoundingClientRect();
+        const dpr = window.devicePixelRatio || 1;
+        canvas.width = Math.round(rect.width * dpr);
+        canvas.height = Math.round(rect.height * dpr);
+        view = canvas.width / W;
+    }
+
+    // Adds a shape to the current path, rotated and scaled about (x, y)
+    function addShape(points, x, y, angle, scale, closed) {
+        const cos = Math.cos(angle) * scale, sin = Math.sin(angle) * scale;
+        ctx.moveTo(x + points[0] * cos - points[1] * sin, y + points[0] * sin + points[1] * cos);
+        for (let i = 2; i < points.length; i += 2) {
+            ctx.lineTo(x + points[i] * cos - points[i + 1] * sin, y + points[i] * sin + points[i + 1] * cos);
+        }
+        if (closed) ctx.closePath();
+    }
+
+    function textWidth(str) {
+        let units = 0;
+        for (const ch of str) units += ch === "©" ? 8 : 6;
+        return units - 2;
+    }
+
+    // Adds text in the arcade font to the current path; size is pixels per font grid unit
+    function addText(str, x, y, size, align) {
+        if (align === "center") x -= textWidth(str) * size / 2;
+        else if (align === "right") x -= textWidth(str) * size;
+        for (const ch of str) {
+            const g = FONT[ch] || [];
+            for (let i = 0; i < g.length; i += 4) {
+                ctx.moveTo(x + g[i] * size, y + g[i + 1] * size);
+                ctx.lineTo(x + g[i + 2] * size, y + g[i + 3] * size);
+            }
+            x += (ch === "©" ? 8 : 6) * size;
+        }
+    }
+
+    // The arcade never shows a lone zero
+    function formatScore(n) {
+        return n === 0 ? "00" : String(n);
+    }
+
+    function addHud() {
+        addText(formatScore(score), 200, 40, 3.5, "right");
+        for (let i = 0; i < ships; i++) {
+            addShape(SHIP_SHAPE, 158 + i * 17, 84, -Math.PI / 2, SHIP_SCALE, false);
+        }
+        addText(formatScore(highScore), W / 2, 40, 2, "center");
+        addText("©1979 ATARI INC", W / 2, 728, 2, "center");
+
+        if (mode === "attract") {
+            if (!(frame & 32)) addText("PUSH START", W / 2, 230, 3.5, "center");
+            addText("1 COIN 1 PLAY", W / 2, 680, 2.5, "center");
+        } else if (mode === "gameover") {
+            addText("GAME OVER", W / 2, 230, 3.5, "center");
+        } else if (modeTimer < 120) {
+            addText("PLAYER 1", W / 2, 230, 3.5, "center");
+        }
+    }
+
+    function render() {
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.fillStyle = "black";
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+        // White vectors with a soft phosphor glow
+        ctx.setTransform(view, 0, 0, view, 0, 0);
+        ctx.strokeStyle = "white";
+        ctx.fillStyle = "white";
+        ctx.lineWidth = 1.5;
+        ctx.lineJoin = "round";
+        ctx.lineCap = "round";
+        ctx.shadowColor = "rgba(255, 255, 255, 0.8)";
+        ctx.shadowBlur = 5 * view;
+
+        ctx.beginPath();
+        for (const r of rocks) addShape(ROCK_SHAPES[r.shape], r.x, r.y, 0, ROCK_SCALE[r.size], true);
+        if (saucer) {
+            for (const part of SAUCER_SHAPES) addShape(part, saucer.x, saucer.y, 0, SAUCER_SCALE[saucer.small ? 1 : 0], false);
+        }
+        if (ship && ship.state === "alive") {
+            addShape(SHIP_SHAPE, ship.x, ship.y, ship.a, SHIP_SCALE, false);
+            if (ship.thrusting && frame % 4 < 2) addShape(FLAME_SHAPE, ship.x, ship.y, ship.a, SHIP_SCALE, false);
+        }
+        addHud();
+        ctx.stroke();
+
+        for (const s of shots.concat(saucerShots)) {
+            ctx.beginPath();
+            ctx.arc(s.x, s.y, 1.8, 0, Math.PI * 2);
+            ctx.fill();
+        }
+
+        for (const p of wreckage) {
+            const cos = Math.cos(p.a), sin = Math.sin(p.a);
+            const dx = p.hx * cos - p.hy * sin, dy = p.hx * sin + p.hy * cos;
+            ctx.globalAlpha = Math.min(1, p.life / 40);
+            ctx.beginPath();
+            ctx.moveTo(p.x - dx, p.y - dy);
+            ctx.lineTo(p.x + dx, p.y + dy);
+            ctx.stroke();
+        }
+
+        ctx.shadowBlur = 0;
+        for (const d of debris) {
+            ctx.globalAlpha = Math.min(1, d.life / 25);
+            ctx.fillRect(d.x - 1, d.y - 1, 2, 2);
+        }
+        ctx.globalAlpha = 1;
+    }
+
+    // Fixed 60 Hz simulation, drawn at whatever rate the display refreshes
+    let lastTime = performance.now();
+    let lag = 0;
+
+    function loop(now) {
+        lag += Math.min(now - lastTime, 250);
+        lastTime = now;
+        while (lag >= FRAME_MS) {
+            step();
+            lag -= FRAME_MS;
+        }
+        render();
+        requestAnimationFrame(loop);
+    }
+
+    // Start in attract mode with rocks drifting
+    window.addEventListener("resize", resize);
+    resize();
+    spawnWave();
+    requestAnimationFrame(loop);
+</script>
+</body>
+</html>
