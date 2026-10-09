@@ -56,6 +56,24 @@
     const OVERLAY_GREEN = 0xFF30FF30;
     const OVERLAY_BLACK = 0xFF000000;
 
+    // Rack: 5 rows of 11, row 0 at the bottom, on a 16-pixel grid. refX/refY is the top-left of
+    // the bottom-left invader's cell, and every other invader is drawn relative to it.
+    const RACK_ROWS = 5;
+    const RACK_COLS = 11;
+    const RACK_START_X = 24;
+    const RACK_FIRST_Y = 128;   // Round 1 (NewGame $07EA)
+    const RACK_STEP = 2;
+    const RACK_DROP = 8;
+    const RACK_RIGHT_EDGE = 213; // RackBump $1597 turns the rack when these screen columns light up
+    const RACK_LEFT_EDGE = 9;
+
+    // Cannon
+    const PLAYER_Y = 216;
+    const PLAYER_MIN_X = 16;
+    const PLAYER_MAX_X = 185;
+    const PLAYER_START_FRAMES = 128; // A new cannon appears after this long ($1B10)
+    const ALIEN_FIRE_DELAY = 48;     // ...and the aliens hold their fire this much longer ($03B0)
+
     // --- GRAPHICS ---
     // Transcribed from the ROM as hex, one byte per screen column from left to right, bit 7 at the top
     const SPRITE_DATA = {
@@ -134,10 +152,40 @@
     for (const ch in FONT_DATA) FONT[ch] = sprite(FONT_DATA[ch]);
 
     // --- GAME STATE ---
+    let mode = "attract"; // attract | playing | gameover
+    let tasksOn = false;  // Whether the invaders, cannon and shots are running
     let frame = 0;
     let score = 0;
     let highScore = loadHighScore();
     let ships = 0;
+
+    let alive = new Uint8Array(RACK_ROWS * RACK_COLS); // Index = row * 11 + column
+    let numAliens = 0;
+    let refX = RACK_START_X;
+    let refY = RACK_FIRST_Y;
+    let rackDX = RACK_STEP;
+    let rackDY = 0;
+    let rackRight = true;
+    let animFrame = 0;
+    let cursor = 0;         // The invader due to be redrawn next
+    let waitOnDraw = false; // The cursor waits until that invader has been drawn
+
+    let player = null;
+    let playerOK = false;   // False while the cannon is blowing up or waiting to reappear
+    let enableAlienFire = false;
+    let alienFireDelay = 0;
+
+    // --- CONTROLS ---
+    const keys = {};    // Keys held down
+    const pressed = {}; // Keys pressed since the last frame
+
+    document.addEventListener("keydown", (e) => {
+        if (["Space", "ArrowLeft", "ArrowRight"].includes(e.code)) e.preventDefault();
+        keys[e.code] = true;
+        if (!e.repeat) pressed[e.code] = true;
+    });
+    document.addEventListener("keyup", (e) => { keys[e.code] = false; });
+    window.addEventListener("blur", () => { for (const k in keys) keys[k] = false; });
 
     // --- HELPERS ---
     function loadHighScore() {
@@ -228,9 +276,148 @@
         drawShips();
     }
 
+    // --- GAME FLOW ---
+    function startGame() {
+        mode = "playing";
+        score = 0;
+        ships = 3;
+        drawHud();
+        newRack(RACK_FIRST_Y);
+        tasksOn = true;
+    }
+
+    // Everything the arcade resets from its ROM copy at the start of a rack
+    function newRack(startY) {
+        clearRect(0, 32, W, 208);
+        alive.fill(1);
+        numAliens = alive.length;
+        refX = RACK_START_X;
+        refY = startY;
+        rackDX = RACK_STEP;
+        rackDY = 0;
+        rackRight = true;
+        animFrame = 0;
+        cursor = 0;
+        waitOnDraw = true;
+        resetPlayer();
+        playerOK = true;
+        enableAlienFire = false;
+        alienFireDelay = ALIEN_FIRE_DELAY;
+    }
+
+    // --- PLAYER ---
+    function resetPlayer() {
+        player = {
+            x: PLAYER_MIN_X,
+            timer: PLAYER_START_FRAMES // Frames until the cannon appears
+        };
+    }
+
+    function updatePlayer() {
+        if (player.timer > 0) {
+            player.timer--;
+            return;
+        }
+        playerOK = true;
+        if (!enableAlienFire && --alienFireDelay === 0) enableAlienFire = true;
+
+        // Right wins if both are held, as in the arcade
+        if (keys["ArrowRight"] || keys["KeyD"]) {
+            if (player.x < PLAYER_MAX_X) player.x++;
+        } else if (keys["ArrowLeft"] || keys["KeyA"]) {
+            if (player.x > PLAYER_MIN_X) player.x--;
+        }
+        writeSprite(SPR.player, player.x, PLAYER_Y);
+    }
+
+    // --- INVADERS ---
+    // The rack ripples: only one invader is redrawn per frame, so a full rack takes 55 frames to
+    // move one step and the last invader moves every frame.
+    function invaderX(index) {
+        return refX + (index % RACK_COLS) * 16;
+    }
+
+    function invaderY(index) {
+        return refY - Math.floor(index / RACK_COLS) * 16;
+    }
+
+    // Invaders overwrite a 16x16 block, their own 8 rows plus the 8 above, which wipes out their
+    // old image when the rack drops (and anything else in the way, like shields)
+    function writeInvader(spr, x, y) {
+        clearRect(x, y - 8, 16, 8);
+        writeSprite(spr, x, y);
+    }
+
+    // DrawAlien $0100
+    function drawInvader() {
+        if (!waitOnDraw) return;
+        if (alive[cursor]) {
+            const type = Math.floor(cursor / RACK_COLS) >> 1; // Octopus, crab, crab... from the bottom row up
+            writeInvader(SPR.invaders[type][animFrame], invaderX(cursor), invaderY(cursor));
+        }
+        waitOnDraw = false;
+    }
+
+    // CursorNextAlien $0141: move on to the next live invader, stepping the rack after the last one
+    function advanceCursor() {
+        if (!playerOK || waitOnDraw || !alive.includes(1)) return;
+        do {
+            if (++cursor === alive.length) {
+                moveRack();
+                cursor = 0;
+            }
+        } while (!alive[cursor]);
+        waitOnDraw = true;
+    }
+
+    // MoveRefAlien $01A1
+    function moveRack() {
+        refX += rackDX;
+        refY += rackDY;
+        rackDY = 0;
+        animFrame ^= 1;
+    }
+
+    // RackBump $1597: any lit pixel at the edge turns the rack, starting from its next step.
+    // A lone invader steps right by 3 instead of 2.
+    function rackBump() {
+        if (rackRight) {
+            if (!columnLit(RACK_RIGHT_EDGE)) return;
+            rackDX = -RACK_STEP;
+        } else {
+            if (!columnLit(RACK_LEFT_EDGE)) return;
+            rackDX = numAliens === 1 ? RACK_STEP + 1 : RACK_STEP;
+        }
+        rackRight = !rackRight;
+        rackDY = RACK_DROP;
+    }
+
+    function columnLit(x) {
+        for (let y = 40; y <= 223; y++) {
+            if (isLit(x, y)) return true;
+        }
+        return false;
+    }
+
+    function countInvaders() {
+        numAliens = alive.reduce((n, a) => n + a, 0);
+    }
+
     // --- GAME LOOP ---
+    // Game tasks run in the arcade's order: its end-of-screen interrupt, its mid-screen interrupt,
+    // then its main loop
+    function runGameTasks() {
+        drawInvader();
+        updatePlayer();
+        advanceCursor();
+        rackBump();
+        countInvaders();
+    }
+
     function step() {
         frame++;
+        if (tasksOn) runGameTasks();
+        for (const k in pressed) delete pressed[k];
     }
 
     // --- RENDERING ---
