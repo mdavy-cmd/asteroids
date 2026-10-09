@@ -62,6 +62,8 @@
     const RACK_COLS = 11;
     const RACK_START_X = 24;
     const RACK_FIRST_Y = 128;   // Round 1 (NewGame $07EA)
+    const RACK_START_Y = [152, 168, 176, 176, 176, 184, 184, 184]; // Rounds 2-9, then repeating (AlienStartTable $1DA3)
+    const ROUND_END_FRAMES = 48;
     const RACK_STEP = 2;
     const RACK_DROP = 8;
     const RACK_RIGHT_EDGE = 213; // RackBump $1597 turns the rack when these screen columns light up
@@ -108,6 +110,9 @@
         "0010001001111010011000010011000111101010011110111110010000010101" +
         "1000000101001111101001100101001110100000000010000001011111100010" +
         "1010101010111011010010110000100100010001010100110010111011101011";
+
+    // The attract-mode demo's moves, one per shot: 1 = right, 2 = left (DemoCommands $1F74)
+    const DEMO_COMMANDS = [1, 1, 0, 0, 1, 0, 2, 1, 0, 2];
 
     // Player's shot (GameObj1 $03BB). Its sprite is an 8-row cell with the bottom 4 rows lit.
     const SHOT_START_Y = 208;
@@ -201,6 +206,7 @@
         bombs: [frames(D.rolling, 4), frames(D.plunger, 4), frames(D.squiggly, 4)],
         bombExplosion: sprite(D.bombExplosion),
         saucer: sprite(D.saucer),
+        saucerIcon: sprite(D.saucer.substr(8, 32)), // The score table shows its middle 16 columns ($1D68)
         saucerExplosion: sprite(D.saucerExplosion),
         shield: sprite(D.shield, 16)
     };
@@ -209,8 +215,13 @@
 
     // --- GAME STATE ---
     let mode = "attract"; // attract | playing | gameover
-    let tasksOn = false;  // Whether the invaders, cannon and shots are running
+    let tasksOn = false;  // Whether the invaders, cannon and shots are running (in a game or the demo)
+    let script = null;    // The sequence driving the screens around the game (see ATTRACT MODE)
     let frame = 0;
+    let rackCount = 0;    // Racks cleared, which sets how low the next one starts
+    let roundEndTimer = 0;
+    let demoCmd = 0;      // Position in DEMO_COMMANDS, carried from one demo to the next
+    let demoMove = 1;
     let score = 0;
     let highScore = loadHighScore();
     let ships = 0;
@@ -264,6 +275,14 @@
             return Number(localStorage.getItem("invadersHighScore")) || 0;
         } catch (e) {
             return 0;
+        }
+    }
+
+    function saveHighScore() {
+        try {
+            localStorage.setItem("invadersHighScore", highScore);
+        } catch (e) {
+            // Storage unavailable (e.g. private browsing); the high score just won't persist
         }
     }
 
@@ -350,20 +369,49 @@
     // --- GAME FLOW ---
     function startGame() {
         mode = "playing";
+        tasksOn = false;
         score = 0;
         ships = START_SHIPS;
         extraShipAvailable = true;
         invadedFlag = false;
+        rackCount = 0;
+        roundEndTimer = 0;
         drawHud();
-        newRack(RACK_FIRST_Y);
-        tasksOn = true;
+        script = startScript();
     }
 
+    // The game stops where it is while "GAME OVER" is typed over it
     function gameOver() {
         mode = "gameover";
         tasksOn = false;
         ships = 0;
         drawShips();
+        if (score > highScore) {
+            highScore = score;
+            saveHighScore();
+            drawScores();
+        }
+        script = gameOverScript();
+    }
+
+    // After the last invader falls (and any cannon explosion ends), a short pause, then the next rack
+    function endOfRound() {
+        if (player.hit) {
+            roundEndTimer = 0;
+            return;
+        }
+        if (++roundEndTimer < ROUND_END_FRAMES) return;
+        roundEndTimer = 0;
+        nextRack();
+    }
+
+    function nextRack() {
+        rackCount = (rackCount & 7) + 1;
+        newRack(RACK_START_Y[rackCount - 1]);
+    }
+
+    function clearPlayfield() {
+        clearRect(0, 32, W, 208);
     }
 
     // Four digits that wrap past 9,999, as in the arcade
@@ -382,7 +430,7 @@
 
     // Everything the arcade resets from its ROM copy at the start of a rack
     function newRack(startY) {
-        clearRect(0, 32, W, 208);
+        clearPlayfield();
         alive.fill(1);
         numAliens = alive.length;
         refX = RACK_START_X;
@@ -406,6 +454,7 @@
         skipPlunger = false;
         resetSaucer();
         tillSaucer = SAUCER_INTERVAL;
+        demoMove = 1;
         drawShields();
         drawBottomLine();
     }
@@ -443,10 +492,11 @@
         playerOK = true;
         if (!enableAlienFire && --alienFireDelay === 0) enableAlienFire = true;
 
-        // Right wins if both are held, as in the arcade
-        if (keys["ArrowRight"] || keys["KeyD"]) {
+        // Right wins if both are held, as in the arcade. The demo follows its own script.
+        const demo = mode === "attract";
+        if (demo ? demoMove & 1 : keys["ArrowRight"] || keys["KeyD"]) {
             if (player.x < PLAYER_MAX_X) player.x++;
-        } else if (keys["ArrowLeft"] || keys["KeyA"]) {
+        } else if (demo ? demoMove & 2 : keys["ArrowLeft"] || keys["KeyA"]) {
             if (player.x > PLAYER_MIN_X) player.x--;
         }
         writeSprite(SPR.player, player.x, PLAYER_Y);
@@ -473,6 +523,7 @@
 
         clearRect(player.x, PLAYER_Y, 16, 8);
         resetPlayer();
+        if (mode !== "playing") return; // The demo just ends
         if (invadedFlag || ships === 1) {
             gameOver();
         } else {
@@ -504,6 +555,13 @@
     // let go (and seen to be let go) between shots.
     function playerFire() {
         if (player.hit || player.timer > 0 || shot.status !== SHOT_IDLE) return;
+        if (mode === "attract") {
+            // The demo fires constantly, taking its next move with each shot
+            shot.status = SHOT_STARTING;
+            demoCmd = (demoCmd + 1) % DEMO_COMMANDS.length;
+            demoMove = DEMO_COMMANDS[demoCmd];
+            return;
+        }
         const down = keys["Space"] || pressed["Space"];
         if (fireBounce) {
             if (!down) fireBounce = false;
@@ -856,9 +914,88 @@
         resetSaucer();
     }
 
+    // --- ATTRACT MODE ---
+    // The screens around the game are scripts that run a frame at a time: each yield waits a frame
+    function* wait(frames) {
+        for (let i = 0; i < frames; i++) yield;
+    }
+
+    // PrintMessageDel $0A93: one letter every 6 frames
+    function* typeText(str, x, y) {
+        for (const ch of str) {
+            drawText(ch, x, y);
+            x += 8;
+            yield* wait(6);
+        }
+    }
+
+    // The arcade's attract cycle (from $0AEA), without the alternate cycle's animated jokes
+    function* attractScript(fromGameOver) {
+        if (fromGameOver) yield* pushScreen();
+        while (true) {
+            yield* wait(64);
+            yield* typeText("PLAY", 96, 64);
+            yield* typeText("SPACE  INVADERS", 56, 88);
+            yield* wait(64);
+            drawText("*SCORE ADVANCE TABLE*", 32, 120);
+            writeSprite(SPR.saucerIcon, 64, 136);
+            writeSprite(SPR.invaders[2][0], 64, 152);
+            writeSprite(SPR.invaders[1][1], 64, 168);
+            writeSprite(SPR.invaders[0][0], 64, 184);
+            yield* typeText("=? MYSTERY", 80, 136);
+            yield* typeText("=30 POINTS", 80, 152);
+            yield* typeText("=20 POINTS", 80, 168);
+            yield* typeText("=10 POINTS", 80, 184);
+            yield* wait(128);
+            yield* demo();
+            yield* pushScreen();
+        }
+    }
+
+    // A silent game that plays itself until its cannon is hit and has finished exploding
+    function* demo() {
+        newRack(RACK_FIRST_Y);
+        invadedFlag = false;
+        tasksOn = true;
+        while (!player.hit && alive.includes(1)) yield;
+        shot.status = SHOT_IDLE;
+        while (player.hit) yield;
+        tasksOn = false;
+    }
+
+    // The screen the arcade shows once a coin is in. Here no coin is needed.
+    function* pushScreen() {
+        clearPlayfield();
+        drawText("PUSH", 96, 96);
+        drawText("ONLY 1PLAYER  BUTTON", 32, 120);
+        yield* wait(128);
+        clearPlayfield();
+    }
+
+    // PromptPlayer $088D: the score blinks while "PLAY PLAYER<1>" shows
+    function* startScript() {
+        clearPlayfield();
+        drawText("PLAY PLAYER<1>", 56, 112);
+        for (let t = 176; t > 0; t--) {
+            if (t & 4) clearRect(24, 24, 32, 8);
+            else drawScores();
+            yield;
+        }
+        drawScores();
+        newRack(RACK_FIRST_Y);
+        tasksOn = true;
+    }
+
+    function* gameOverScript() {
+        yield* typeText("GAME OVER", 72, 56);
+        yield* wait(128);
+        mode = "attract";
+        yield* attractScript(true);
+    }
+
     // --- GAME LOOP ---
     // Game tasks run in the arcade's order: its end-of-screen interrupt, its mid-screen interrupt,
-    // then its main loop
+    // then its main loop, which pauses at the end of a round
     function runGameTasks() {
         drawInvader();
         updatePlayer();
@@ -866,6 +1003,10 @@
         updateBombs();
         timeSaucer();
         advanceCursor();
+        if (numAliens === 0 && mode === "playing") {
+            endOfRound();
+            return;
+        }
         playerFire();
         playerShotHit();
         rackBump();
@@ -875,7 +1016,9 @@
 
     function step() {
         frame++;
+        if (mode === "attract" && (pressed["Enter"] || pressed["Space"])) startGame();
         if (tasksOn) runGameTasks();
+        if (script && script.next().done) script = null;
         for (const k in pressed) delete pressed[k];
     }
 
@@ -934,6 +1077,7 @@
     window.addEventListener("resize", resize);
     resize();
     drawHud();
+    script = attractScript(false);
     requestAnimationFrame(loop);
 </script>
 </body>
