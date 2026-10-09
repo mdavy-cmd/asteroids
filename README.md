@@ -6,13 +6,13 @@ A faithful recreation of Atari's 1979 arcade *Asteroids* in a single HTML file, 
 
 ## Play
 
-There's nothing to install or build. Open `index.html` in any modern browser and press **Enter**.
+There's nothing to install or build. Open `asteroids.html` in any modern browser and press **Enter**.
 
 You can also serve it locally:
 
 ```sh
 python3 -m http.server
-# then visit http://localhost:8000
+# then visit http://localhost:8000/asteroids.html
 ```
 
 ### Controls
@@ -61,7 +61,7 @@ You start with 3 ships and earn an extra one every 10,000 points. The high score
 
 ## Code tour
 
-Everything lives in `index.html`: about 900 lines of plain JavaScript drawing on a `<canvas>`, with no libraries.
+Everything lives in `asteroids.html`: about 900 lines of plain JavaScript drawing on a `<canvas>`, with no libraries.
 
 - The playfield uses the arcade's own 1024×768 vector coordinates, and the game advances in fixed 60 Hz steps like the original hardware. Speeds are in pixels per frame and timers in frames, so the constants at the top of the script can be compared directly with the ROM.
 - The code is split into sections marked with `// --- NAME ---` comments: vector shapes, game state, controls, sound, helpers, game flow, ship, shots, rocks, saucer, explosions, collisions, game loop and rendering.
