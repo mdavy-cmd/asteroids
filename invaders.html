@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Classic Space Invaders</title>
+    <style>
+        html, body {
+            height: 100%;
+        }
+        body {
+            background-color: #000;
+            color: #777;
+            margin: 0;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            font-family: 'Courier New', Courier, monospace;
+        }
+        canvas {
+            display: block;
+            background-color: #000;
+            width: min(100vw, calc((100vh - 40px) * 7 / 8));
+            aspect-ratio: 7 / 8;
+        }
+        .instructions {
+            margin-top: 10px;
+            text-align: center;
+            font-size: 13px;
+        }
+    </style>
+</head>
+<body>
+
+    <canvas id="gameCanvas" width="224" height="256"></canvas>
+    <div class="instructions">
+        [LEFT / RIGHT] Move | [SPACE] Fire | [ENTER] Start | [M] Sound
+    </div>
+
+<script>
+    const canvas = document.getElementById("gameCanvas");
+    const ctx = canvas.getContext("2d");
+
+    // The screen is the arcade's own 224x256 pixels, as seen on its upright (rotated) monitor:
+    // x runs right from 0 to 223 and y runs down from 0 to 255. Timers are in frames at 60 per second.
+    // Addresses like $1C00 point into the ROM disassembly at computerarcheology.com.
+    const W = 224;
+    const H = 256;
+    const FRAME_MS = 1000 / 60;
+
+    // Colour overlay: the cabinet's monitor sat behind strips of coloured film
+    const OVERLAY_WHITE = 0xFFFFFFFF; // Colours as little-endian RGBA words for ImageData
+    const OVERLAY_RED = 0xFF3030FF;
+    const OVERLAY_GREEN = 0xFF30FF30;
+    const OVERLAY_BLACK = 0xFF000000;
+
+    // --- GRAPHICS ---
+    // Transcribed from the ROM as hex, one byte per screen column from left to right, bit 7 at the top
+    const SPRITE_DATA = {
+        octopus0: "000039797A6EECFAFAEC6E7A79390000",        // $1C00, 10 points
+        octopus1: "0000387A7F6DECFAFAEC6D7F7A380000",        // $1C30
+        crab0: "000000781DBE6C3C3C3C6CBE1D780000",           // $1C10, 20 points
+        crab1: "0000000E18BE6D3D3C3D6DBE180E0000",           // $1C40
+        squid0: "00000000193A6DFAFA6D3A1900000000",          // $1C20, 30 points
+        squid1: "000000001A3D68FCFC683D1A00000000",          // $1C50
+        invaderExplosion: "00084922148142004281142249080000", // $1CC0
+        player: "00000F1F1F1F1F7FFF7F1F1F1F1F0F00",          // $1C60
+        playerExplosion0: "000401130307B30F2F032F4904030001", // $1C70
+        playerExplosion1: "400805A30A035B0F27270B4B40841148", // $1C80
+        playerShot: "0F",                                    // $1C90
+        shotExplosion: "993C7E3DBC3E7C99",                   // $1C91
+        rolling: "00FE00" + "24FE12" + "00FE00" + "48FE90",  // $1CEE, four frames of three columns
+        plunger: "04FC04" + "10FC10" + "20FC20" + "80FC80",  // $1CE2
+        squiggly: "44AA10" + "885422" + "10AA44" + "225488", // $1CD0
+        bombExplosion: "4A15BE3F5E25",                       // $1CDC
+        saucer: "00000000040C1E373E7C747E7E747C3E371E0C0400000000",          // $1D64
+        saucerExplosion: "002200A54008983DB63C361D104862B61D98084290080000", // $1D7C
+        // $1D20: two bytes per column, the lower 8 pixels first
+        shield: "FF0FFF1FFF3FFF7FFFFFFCFFF8FFF0FFF0FFF0FFF0FFF0FFF0FFF0FFF8FFFCFFFFFFFFFFFF7FFF3FFF1FFF0F"
+    };
+
+    // The character set at $1E00, 8 bytes per character
+    const FONT_DATA = {
+        "A": "001F2444241F0000", "B": "007F494949360000", "C": "003E414141220000", "D": "007F4141413E0000",
+        "E": "007F494949410000", "F": "007F484848400000", "G": "003E414145470000", "H": "007F0808087F0000",
+        "I": "0000417F41000000", "J": "00020101017E0000", "K": "007F081422410000", "L": "007F010101010000",
+        "M": "007F2018207F0000", "N": "007F1008047F0000", "O": "003E4141413E0000", "P": "007F484848300000",
+        "Q": "003E4145423D0000", "R": "007F484C4A310000", "S": "0032494949260000", "T": "0040407F40400000",
+        "U": "007E0101017E0000", "V": "007C0201027C0000", "W": "007F020C027F0000", "X": "0063140814630000",
+        "Y": "0060100F10600000", "Z": "0043454951610000", "0": "003E4549513E0000", "1": "0000217F01000000",
+        "2": "0023454949310000", "3": "0042414959660000", "4": "000C14247F040000", "5": "00725151514E0000",
+        "6": "001E294949460000", "7": "0040474850600000", "8": "0036494949360000", "9": "003149494A3C0000",
+        "<": "0008142241000000", ">": "0000412214080000", " ": "0000000000000000", "=": "0014141414140000",
+        "*": "0022147F14220000", "?": "0020404D50200000", "-": "0008080808080000"
+    };
+
+    // A sprite is a list of column bit patterns, with bit (h - 1) at the top
+    function sprite(hex, height = 8) {
+        const bytes = hex.match(/../g).map(b => parseInt(b, 16));
+        const cols = [];
+        for (let i = 0; i < bytes.length; i += height / 8) {
+            cols.push(height === 16 ? bytes[i + 1] << 8 | bytes[i] : bytes[i]);
+        }
+        return { w: cols.length, h: height, cols: cols };
+    }
+
+    // Splits a strip of equal-width animation frames
+    function frames(hex, count) {
+        const len = hex.length / count;
+        return Array.from({ length: count }, (_, i) => sprite(hex.substr(i * len, len)));
+    }
+
+    const D = SPRITE_DATA;
+    const SPR = {
+        invaders: [
+            [sprite(D.octopus0), sprite(D.octopus1)],
+            [sprite(D.crab0), sprite(D.crab1)],
+            [sprite(D.squid0), sprite(D.squid1)]
+        ],
+        invaderExplosion: sprite(D.invaderExplosion),
+        player: sprite(D.player),
+        playerExplosion: [sprite(D.playerExplosion0), sprite(D.playerExplosion1)],
+        playerShot: sprite(D.playerShot),
+        shotExplosion: sprite(D.shotExplosion),
+        bombs: [frames(D.rolling, 4), frames(D.plunger, 4), frames(D.squiggly, 4)],
+        bombExplosion: sprite(D.bombExplosion),
+        saucer: sprite(D.saucer),
+        saucerExplosion: sprite(D.saucerExplosion),
+        shield: sprite(D.shield, 16)
+    };
+    const FONT = {};
+    for (const ch in FONT_DATA) FONT[ch] = sprite(FONT_DATA[ch]);
+
+    // --- GAME STATE ---
+    let frame = 0;
+    let score = 0;
+    let highScore = loadHighScore();
+    let ships = 0;
+
+    // --- HELPERS ---
+    function loadHighScore() {
+        try {
+            return Number(localStorage.getItem("invadersHighScore")) || 0;
+        } catch (e) {
+            return 0;
+        }
+    }
+
+    // --- SCREEN ---
+    // Like the arcade's video memory, the screen is never wiped: each object erases its old image
+    // and draws its new one, and anything drawn onto lit pixels has hit something.
+    const screen = new Uint8Array(W * H);
+
+    // Visits each lit pixel of a sprite that lands on screen
+    function eachPixel(spr, x, y, fn) {
+        for (let i = 0; i < spr.w; i++) {
+            const px = x + i;
+            if (px < 0 || px >= W) continue;
+            for (let r = 0; r < spr.h; r++) {
+                const py = y + r;
+                if (py >= 0 && py < H && spr.cols[i] & 1 << (spr.h - 1 - r)) fn(py * W + px);
+            }
+        }
+    }
+
+    // ORs a sprite onto the screen and reports whether it touched anything already there
+    function drawSprite(spr, x, y) {
+        let hit = false;
+        eachPixel(spr, x, y, k => {
+            if (screen[k]) hit = true;
+            screen[k] = 1;
+        });
+        return hit;
+    }
+
+    // Clears the sprite's lit pixels, whatever they belong to now
+    function eraseSprite(spr, x, y) {
+        eachPixel(spr, x, y, k => { screen[k] = 0; });
+    }
+
+    // Overwrites the sprite's whole block, blank pixels included
+    function writeSprite(spr, x, y) {
+        clearRect(x, y, spr.w, spr.h);
+        drawSprite(spr, x, y);
+    }
+
+    function clearRect(x, y, w, h) {
+        for (let py = Math.max(y, 0); py < Math.min(y + h, H); py++) {
+            screen.fill(0, py * W + Math.max(x, 0), py * W + Math.min(x + w, W));
+        }
+    }
+
+    function isLit(x, y) {
+        return screen[y * W + x] === 1;
+    }
+
+    // Text sits in 8x8 character cells
+    function drawText(str, x, y) {
+        for (const ch of str) {
+            writeSprite(FONT[ch] || FONT[" "], x, y);
+            x += 8;
+        }
+    }
+
+    // --- HUD ---
+    function formatScore(n) {
+        return String(n).padStart(4, "0");
+    }
+
+    function drawScores() {
+        drawText(formatScore(score), 24, 24);
+        drawText(formatScore(highScore), 88, 24);
+    }
+
+    // The digit counts the cannon in play; the icons show the ones in reserve
+    function drawShips() {
+        drawText(String(ships), 8, 240);
+        clearRect(24, 240, 112, 8);
+        for (let i = 0; i < ships - 1; i++) writeSprite(SPR.player, 24 + i * 16, 240);
+    }
+
+    function drawHud() {
+        drawText(" SCORE<1> HI-SCORE SCORE<2> ", 0, 8);
+        drawScores();
+        drawText("CREDIT 00", 136, 240);
+        drawShips();
+    }
+
+    // --- GAME LOOP ---
+    function step() {
+        frame++;
+    }
+
+    // --- RENDERING ---
+    // The colour of each screen pixel under the overlay: red across the saucer's row, green over
+    // the shields and cannon, and green under the spare cannons on the bottom row
+    const overlay = new Uint32Array(W * H);
+    for (let y = 0; y < H; y++) {
+        for (let x = 0; x < W; x++) {
+            let colour = OVERLAY_WHITE;
+            if (y >= 32 && y <= 62) colour = OVERLAY_RED;
+            else if (y >= 184 && y <= 239) colour = OVERLAY_GREEN;
+            else if (y >= 240 && x >= 16 && x <= 133) colour = OVERLAY_GREEN;
+            overlay[y * W + x] = colour;
+        }
+    }
+
+    const frameCanvas = document.createElement("canvas");
+    frameCanvas.width = W;
+    frameCanvas.height = H;
+    const frameCtx = frameCanvas.getContext("2d");
+    const frameImage = frameCtx.createImageData(W, H);
+    const framePixels = new Uint32Array(frameImage.data.buffer);
+
+    // The canvas is a whole-number multiple of the arcade screen so every pixel scales evenly;
+    // the browser then fits it to the window
+    function resize() {
+        const rect = canvas.getBoundingClientRect();
+        const scale = Math.max(1, Math.ceil(rect.width * (window.devicePixelRatio || 1) / W));
+        canvas.width = W * scale;
+        canvas.height = H * scale;
+    }
+
+    function render() {
+        for (let i = 0; i < screen.length; i++) framePixels[i] = screen[i] ? overlay[i] : OVERLAY_BLACK;
+        frameCtx.putImageData(frameImage, 0, 0);
+        ctx.imageSmoothingEnabled = false;
+        ctx.drawImage(frameCanvas, 0, 0, canvas.width, canvas.height);
+    }
+
+    // Fixed 60 Hz simulation, drawn at whatever rate the display refreshes
+    let lastTime = performance.now();
+    let lag = 0;
+
+    function loop(now) {
+        lag += Math.min(now - lastTime, 250);
+        lastTime = now;
+        while (lag >= FRAME_MS) {
+            step();
+            lag -= FRAME_MS;
+        }
+        render();
+        requestAnimationFrame(loop);
+    }
+
+    window.addEventListener("resize", resize);
+    resize();
+    drawHud();
+    requestAnimationFrame(loop);
+</script>
+</body>
+</html>
