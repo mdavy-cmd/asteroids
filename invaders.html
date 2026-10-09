@@ -73,8 +73,24 @@
     const PLAYER_MAX_X = 185;
     const PLAYER_START_FRAMES = 128; // A new cannon appears after this long ($1B10)
     const ALIEN_FIRE_DELAY = 48;     // ...and the aliens hold their fire this much longer ($03B0)
+    const PLAYER_EXPLOSION_CHANGES = 12; // The blown-up cannon flickers 11 times, 5 frames apart ($1B17)
+    const PLAYER_EXPLOSION_STEP = 5;
+    const INVADED_Y = 216;           // An invader reaching the cannon's row ends the game
     const START_SHIPS = 3;
     const EXTRA_SHIP_POINTS = 1500;
+
+    // Alien shots ("bombs"). Each moves once every 3 frames, the three taking turns.
+    const BOMB_ROLLING = 0;  // Aimed at the cannon (GameObj2 $0476)
+    const BOMB_PLUNGER = 1;  // Columns from a table (GameObj3 $04B6)
+    const BOMB_SQUIGGLY = 2; // Columns from a table (GameObj4 $0682)
+    const BOMB_SPEED = 4;
+    const BOMB_FAST_SPEED = 5;     // Once 8 or fewer invaders remain (SpeedShots $08D8)
+    const BOMB_BOTTOM_Y = 228;     // Explodes on the line here
+    const BOMB_PLAYER_TOP = 210;   // A collision with the bomb's top this low hits the cannon
+    const BOMB_PLAYER_BOTTOM = 218;
+    const BOMB_EXPLOSION_TICKS = 4; // The explosion shows for 3 moves
+    const PLUNGER_COLUMNS = [1, 7, 1, 1, 1, 4, 11, 1, 6, 3, 1, 1, 11, 9, 2, 8]; // $1D00
+    const SQUIGGLY_COLUMNS = [11, 1, 6, 3, 1, 1, 11, 9, 2, 8, 2, 11, 4, 7, 10]; // $1D06
 
     // Player's shot (GameObj1 $03BB). Its sprite is an 8-row cell with the bottom 4 rows lit.
     const SHOT_START_Y = 208;
@@ -199,10 +215,16 @@
     let enableAlienFire = false;
     let alienFireDelay = 0;
 
+    let invadedFlag = false;
+
     let shot = null;
     let fireBounce = false; // Fire must be let go between shots
     let shotCount = 0;      // Shots fired this rack
     let invaderExplosion = { timer: 0, x: 0, y: 0 };
+
+    let bombs = [];
+    let bombSpeed = BOMB_SPEED;
+    let skipPlunger = false; // Plunger bombs stop once only one invader is left
 
     // --- CONTROLS ---
     const keys = {};    // Keys held down
@@ -311,9 +333,17 @@
         score = 0;
         ships = START_SHIPS;
         extraShipAvailable = true;
+        invadedFlag = false;
         drawHud();
         newRack(RACK_FIRST_Y);
         tasksOn = true;
+    }
+
+    function gameOver() {
+        mode = "gameover";
+        tasksOn = false;
+        ships = 0;
+        drawShips();
     }
 
     // Four digits that wrap past 9,999, as in the arcade
@@ -351,6 +381,9 @@
         fireBounce = false;
         shotCount = 0;
         invaderExplosion.timer = 0;
+        bombs = [BOMB_ROLLING, BOMB_PLUNGER, BOMB_SQUIGGLY].map(type => newBomb(type, 0));
+        bombSpeed = BOMB_SPEED;
+        skipPlunger = false;
         drawShields();
         drawBottomLine();
     }
@@ -367,13 +400,22 @@
     function resetPlayer() {
         player = {
             x: PLAYER_MIN_X,
-            timer: PLAYER_START_FRAMES // Frames until the cannon appears
+            timer: PLAYER_START_FRAMES, // Frames until the cannon appears
+            hit: false,
+            blowDelay: PLAYER_EXPLOSION_STEP,
+            blowChanges: PLAYER_EXPLOSION_CHANGES,
+            blowFrame: 0
         };
     }
 
+    // GameObj0 $028E
     function updatePlayer() {
         if (player.timer > 0) {
             player.timer--;
+            return;
+        }
+        if (player.hit) {
+            blowUpPlayer();
             return;
         }
         playerOK = true;
@@ -386,6 +428,42 @@
             if (player.x > PLAYER_MIN_X) player.x--;
         }
         writeSprite(SPR.player, player.x, PLAYER_Y);
+    }
+
+    function hitPlayer() {
+        player.hit = true;
+        player.blowFrame = 0;
+    }
+
+    // The intact cannon stays for 5 frames, then the two explosion pictures alternate. From the
+    // first change the invaders stop and hold their fire.
+    function blowUpPlayer() {
+        if (--player.blowDelay > 0) return;
+        playerOK = false;
+        enableAlienFire = false;
+        alienFireDelay = ALIEN_FIRE_DELAY;
+        player.blowDelay = PLAYER_EXPLOSION_STEP;
+        if (--player.blowChanges > 0) {
+            player.blowFrame ^= 1;
+            writeSprite(SPR.playerExplosion[player.blowFrame], player.x, PLAYER_Y);
+            return;
+        }
+
+        clearRect(player.x, PLAYER_Y, 16, 8);
+        resetPlayer();
+        if (invadedFlag || ships === 1) {
+            gameOver();
+        } else {
+            ships--;
+            drawShips();
+        }
+    }
+
+    // The game is over as soon as the cannon finishes exploding, whatever is left in reserve
+    function invaded() {
+        if (invadedFlag) return;
+        invadedFlag = true;
+        hitPlayer();
     }
 
     // --- PLAYER SHOT ---
@@ -403,7 +481,7 @@
     // PlrFireOrDemo $1618. The button is only checked while no shot is on screen, so it has to be
     // let go (and seen to be let go) between shots.
     function playerFire() {
-        if (player.timer > 0 || shot.status !== SHOT_IDLE) return;
+        if (player.hit || player.timer > 0 || shot.status !== SHOT_IDLE) return;
         const down = keys["Space"] || pressed["Space"];
         if (fireBounce) {
             if (!down) fireBounce = false;
@@ -467,10 +545,9 @@
             shot.status = SHOT_EXPLODING;
             return;
         }
-        // Otherwise find the rack cell where it hit. As in the ROM, a shot just left of the rack
-        // counts as column 0, and column 11 runs on into the next row up.
+        // Otherwise find the rack cell where it hit. Column 11 runs on into the next row up, as in the ROM.
         const row = Math.ceil((refY - shot.y + 6) / 16) - 1;
-        const col = shot.x > refX ? Math.ceil((shot.x - refX) / 16) - 1 : 0;
+        const col = findColumn(shot.x) - 1;
         const index = row * RACK_COLS + col;
         if (index >= alive.length || !alive[index]) {
             shot.status = SHOT_EXPLODING; // No invader there, so it hit a bomb
@@ -527,7 +604,24 @@
                 cursor = 0;
             }
         } while (!alive[cursor]);
+        if (invaderY(cursor) >= INVADED_Y) {
+            invaded();
+            return;
+        }
         waitOnDraw = true;
+    }
+
+    // The rack column (from 1) over screen column x. As in the ROM's FindColumn, anything left of
+    // the rack counts as column 1.
+    function findColumn(x) {
+        return x > refX ? Math.ceil((x - refX) / 16) : 1;
+    }
+
+    function lowestInColumn(col) {
+        for (let index = col - 1; index < alive.length; index += RACK_COLS) {
+            if (alive[index]) return index;
+        }
+        return -1;
     }
 
     // MoveRefAlien $01A1
@@ -561,6 +655,108 @@
 
     function countInvaders() {
         numAliens = alive.reduce((n, a) => n + a, 0);
+        if (numAliens <= 8) bombSpeed = BOMB_FAST_SPEED;
+    }
+
+    // --- ALIEN SHOTS ---
+    function newBomb(type, colPtr) {
+        return {
+            type: type,
+            active: false,
+            blowing: false,
+            blowCnt: BOMB_EXPLOSION_TICKS,
+            steps: 0,      // Moves made, which sets when the other bombs may fire
+            x: 0,
+            y: 0,
+            frameIdx: 0,
+            sprite: SPR.bombs[type][0],
+            colPtr: colPtr, // Position in the column table, kept from bomb to bomb
+            skipFirst: type === BOMB_ROLLING // The rolling bomb sits out its first turn after each reset
+        };
+    }
+
+    // AShotReloadRate $170E: a new bomb waits until the others have made this many moves
+    function reloadRate(points) {
+        const hundreds = Math.floor(points / 100);
+        if (hundreds <= 2) return 48;
+        if (hundreds <= 10) return 16;
+        if (hundreds <= 20) return 11;
+        if (hundreds <= 30) return 8;
+        return 7;
+    }
+
+    // One bomb gets a turn each frame: rolling, plunger, then squiggly
+    function updateBombs() {
+        const turn = frame % 3;
+        if (turn === BOMB_PLUNGER && skipPlunger) return;
+        const b = bombs[turn];
+        if (b.skipFirst) {
+            b.skipFirst = false;
+            return;
+        }
+        handleBomb(b, bombs.filter(o => o !== b));
+        if (b.blowCnt > 0) return;
+        // The explosion is over: the bomb is ready to fire again
+        bombs[turn] = newBomb(b.type, b.colPtr);
+        if (b.type === BOMB_PLUNGER && numAliens === 1) skipPlunger = true;
+    }
+
+    // HandleAlienShot $0563
+    function handleBomb(b, others) {
+        if (!b.active) {
+            if (!enableAlienFire) return;
+            b.steps = 0;
+            const rate = reloadRate(score);
+            if (others.some(o => o.steps !== 0 && o.steps <= rate)) return;
+
+            let col;
+            if (b.type === BOMB_ROLLING) {
+                col = Math.min(findColumn(player.x + 8), RACK_COLS);
+            } else {
+                const table = b.type === BOMB_PLUNGER ? PLUNGER_COLUMNS : SQUIGGLY_COLUMNS;
+                col = table[b.colPtr];
+                b.colPtr = (b.colPtr + 1) % table.length;
+            }
+            // The lowest invader in the column fires, from just below itself
+            const index = lowestInColumn(col);
+            if (index < 0) return;
+            b.x = invaderX(index) + 7;
+            b.y = invaderY(index) + 10;
+            b.active = true;
+            b.steps = 1;
+            return;
+        }
+
+        if (b.blowing) {
+            explodeBomb(b);
+            return;
+        }
+        b.steps++;
+        eraseSprite(b.sprite, b.x, b.y);
+        b.frameIdx = (b.frameIdx + 1) % 4;
+        b.sprite = SPR.bombs[b.type][b.frameIdx];
+        b.y += bombSpeed;
+        const collided = drawSprite(b.sprite, b.x, b.y);
+        if (b.y >= BOMB_BOTTOM_Y) {
+            b.blowing = true;
+        } else if (collided) {
+            if (b.y >= BOMB_PLAYER_TOP && b.y <= BOMB_PLAYER_BOTTOM) hitPlayer();
+            b.blowing = true;
+        }
+    }
+
+    // ShotBlowingUp $0644: the explosion replaces the bomb, then erasing it bites out what it covered
+    function explodeBomb(b) {
+        b.blowCnt--;
+        if (b.blowCnt === BOMB_EXPLOSION_TICKS - 1) {
+            eraseSprite(b.sprite, b.x, b.y);
+            b.sprite = SPR.bombExplosion;
+            b.x -= 2;
+            b.y += 2;
+            drawSprite(b.sprite, b.x, b.y);
+        } else if (b.blowCnt === 0) {
+            eraseSprite(b.sprite, b.x, b.y);
+        }
     }
 
     // --- GAME LOOP ---
@@ -570,6 +766,7 @@
         drawInvader();
         updatePlayer();
         updatePlayerShot();
+        updateBombs();
         advanceCursor();
         playerFire();
         playerShotHit();
