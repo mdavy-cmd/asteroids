@@ -24,6 +24,7 @@
             background-color: #000;
             width: min(100vw, calc((100vh - 40px) * 7 / 8));
             aspect-ratio: 7 / 8;
+            image-rendering: pixelated;
         }
         .instructions {
             margin-top: 10px;
@@ -1209,13 +1210,12 @@
     const frameImage = frameCtx.createImageData(W, H);
     const framePixels = new Uint32Array(frameImage.data.buffer);
 
-    // The canvas is a whole-number multiple of the arcade screen so every pixel scales evenly;
-    // the browser then fits it to the window
+    // The canvas has one pixel per display pixel, so the arcade's pixels are scaled up without
+    // blurring (at most sizes some come out one display pixel wider than others)
     function resize() {
         const rect = canvas.getBoundingClientRect();
-        const scale = Math.max(1, Math.ceil(rect.width * (window.devicePixelRatio || 1) / W));
-        canvas.width = W * scale;
-        canvas.height = H * scale;
+        canvas.width = Math.max(1, Math.round(rect.width * (window.devicePixelRatio || 1)));
+        canvas.height = Math.round(canvas.width * H / W);
     }
 
     function render() {
