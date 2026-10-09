@@ -92,6 +92,23 @@
     const PLUNGER_COLUMNS = [1, 7, 1, 1, 1, 4, 11, 1, 6, 3, 1, 1, 11, 9, 2, 8]; // $1D00
     const SQUIGGLY_COLUMNS = [11, 1, 6, 3, 1, 1, 11, 9, 2, 8, 2, 11, 4, 7, 10]; // $1D06
 
+    // Saucer. It takes the squiggly bomb's turn, so it moves once every 3 frames.
+    const SAUCER_INTERVAL = 1536;   // Frames between saucers (TimeToSaucer $0913)
+    const SAUCER_Y = 40;
+    const SAUCER_SPEED = 2;
+    const SAUCER_MIN_INVADERS = 8;
+    const SAUCER_ZONE_Y = 42;       // A shot colliding at this height or above has hit the saucer
+    const SAUCER_HIT_TICKS = 32;    // After a hit: explosion at 31, score at 24, cleared at 0
+    // Points by shots fired this rack (SaucerScrTab $1D54). A ROM bug skips the table's 16th entry,
+    // so it repeats every 15 shots and the 8th, 23rd, 38th... shot is worth 300.
+    const SAUCER_SCORES = [100, 50, 50, 100, 150, 100, 100, 50, 300, 100, 100, 100, 50, 150, 100];
+    // Bit 0 of ROM bytes $0800-$08FF, indexed by shots fired this rack: 1 = enter from the left
+    const SAUCER_DIRECTION_BITS =
+        "1010111010100011011111011100100100101111101000101110111110010111" +
+        "0010001001111010011000010011000111101010011110111110010000010101" +
+        "1000000101001111101001100101001110100000000010000001011111100010" +
+        "1010101010111011010010110000100100010001010100110010111011101011";
+
     // Player's shot (GameObj1 $03BB). Its sprite is an 8-row cell with the bottom 4 rows lit.
     const SHOT_START_Y = 208;
     const SHOT_SPEED = 4;
@@ -225,6 +242,9 @@
     let bombs = [];
     let bombSpeed = BOMB_SPEED;
     let skipPlunger = false; // Plunger bombs stop once only one invader is left
+
+    let saucer = null;
+    let tillSaucer = SAUCER_INTERVAL;
 
     // --- CONTROLS ---
     const keys = {};    // Keys held down
@@ -384,6 +404,8 @@
         bombs = [BOMB_ROLLING, BOMB_PLUNGER, BOMB_SQUIGGLY].map(type => newBomb(type, 0));
         bombSpeed = BOMB_SPEED;
         skipPlunger = false;
+        resetSaucer();
+        tillSaucer = SAUCER_INTERVAL;
         drawShields();
         drawBottomLine();
     }
@@ -522,11 +544,15 @@
         }
     }
 
-    // EndOfBlowup $0436
+    // EndOfBlowup $0436. Each shot fired also picks the side the next saucer will come from.
     function endOfShot() {
         eraseSprite(shot.sprite, shot.x, shot.y);
         resetShot();
         shotCount++;
+        if (saucer.active) return;
+        const fromLeft = SAUCER_DIRECTION_BITS[shotCount % 256] === "1";
+        saucer.x = fromLeft ? 9 : 192;
+        saucer.dx = fromLeft ? SAUCER_SPEED : -SAUCER_SPEED;
     }
 
     // PlayerShotHit $14D8: work out what the shot ran into from where it was
@@ -539,6 +565,11 @@
         if (!shot.collided) return;
         shot.collided = false;
 
+        if (shot.y <= SAUCER_ZONE_Y) {
+            saucer.hit = true;
+            shot.status = SHOT_DONE;
+            return;
+        }
         // Below the rack it must be a shield or a bomb, unless the rack's bottom-left corner has
         // dropped off the screen (with its top rows down in the shields)
         if (refY <= 248 && shot.y >= refY + 6) {
@@ -685,10 +716,16 @@
         return 7;
     }
 
-    // One bomb gets a turn each frame: rolling, plunger, then squiggly
+    // One bomb gets a turn each frame: rolling, plunger, then squiggly. A saucer that's due takes
+    // the squiggly's turn once that bomb is out of the way.
     function updateBombs() {
         const turn = frame % 3;
         if (turn === BOMB_PLUNGER && skipPlunger) return;
+        if (turn === BOMB_SQUIGGLY && saucer.start && bombs[BOMB_SQUIGGLY].steps === 0 &&
+            (saucer.active || numAliens >= SAUCER_MIN_INVADERS)) {
+            updateSaucer();
+            return;
+        }
         const b = bombs[turn];
         if (b.skipFirst) {
             b.skipFirst = false;
@@ -759,6 +796,66 @@
         }
     }
 
+    // --- SAUCER ---
+    function resetSaucer() {
+        saucer = {
+            start: false,  // Due to appear
+            active: false, // On screen
+            hit: false,
+            hitTimer: SAUCER_HIT_TICKS,
+            x: 9,
+            dx: SAUCER_SPEED
+        };
+    }
+
+    // TimeToSaucer $0913: the countdown only runs once the rack is below round 1's starting
+    // height (and, as in the ROM, stops if its bottom-left corner drops off the screen)
+    function timeSaucer() {
+        if (refY <= RACK_FIRST_Y || refY > 248) return;
+        if (tillSaucer === 0) {
+            tillSaucer = SAUCER_INTERVAL;
+            saucer.start = true;
+        }
+        tillSaucer--;
+    }
+
+    function updateSaucer() {
+        if (!saucer.active) {
+            saucer.active = true;
+            writeSprite(SPR.saucer, saucer.x, SAUCER_Y);
+        }
+        if (saucer.hit) {
+            saucerHitTick();
+            return;
+        }
+        // The sprite's blank edges wipe out its trail
+        saucer.x += saucer.dx;
+        writeSprite(SPR.saucer, saucer.x, SAUCER_Y);
+        if (saucer.x < 8 || saucer.x >= 193) removeSaucer();
+    }
+
+    function saucerHitTick() {
+        saucer.hitTimer--;
+        if (saucer.hitTimer === SAUCER_HIT_TICKS - 1) {
+            writeSprite(SPR.saucerExplosion, saucer.x, SAUCER_Y);
+        } else if (saucer.hitTimer === 24) {
+            const points = saucerPoints();
+            addScore(points);
+            drawText(String(points).padStart(3, " "), saucer.x, SAUCER_Y);
+        } else if (saucer.hitTimer === 0) {
+            removeSaucer();
+        }
+    }
+
+    function saucerPoints() {
+        return SAUCER_SCORES[shotCount % SAUCER_SCORES.length];
+    }
+
+    function removeSaucer() {
+        clearRect(saucer.x, SAUCER_Y, 24, 8);
+        resetSaucer();
+    }
+
     // --- GAME LOOP ---
     // Game tasks run in the arcade's order: its end-of-screen interrupt, its mid-screen interrupt,
     // then its main loop
@@ -767,6 +864,7 @@
         updatePlayer();
         updatePlayerShot();
         updateBombs();
+        timeSaucer();
         advanceCursor();
         playerFire();
         playerShotHit();
