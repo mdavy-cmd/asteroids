@@ -73,6 +73,29 @@
     const PLAYER_MAX_X = 185;
     const PLAYER_START_FRAMES = 128; // A new cannon appears after this long ($1B10)
     const ALIEN_FIRE_DELAY = 48;     // ...and the aliens hold their fire this much longer ($03B0)
+    const START_SHIPS = 3;
+    const EXTRA_SHIP_POINTS = 1500;
+
+    // Player's shot (GameObj1 $03BB). Its sprite is an 8-row cell with the bottom 4 rows lit.
+    const SHOT_START_Y = 208;
+    const SHOT_SPEED = 4;
+    const SHOT_TOP_Y = 32;    // Explodes on reaching this height (PlayerShotHit $14E4)
+    const SHOT_EXPLOSION_FRAMES = 16;
+    const INVADER_EXPLOSION_FRAMES = 16;
+    const INVADER_POINTS = [10, 10, 20, 20, 30]; // By row, from the bottom ($1DA0)
+
+    // Player shot states, numbered as in the ROM ($2025)
+    const SHOT_IDLE = 0;
+    const SHOT_STARTING = 1;
+    const SHOT_MOVING = 2;
+    const SHOT_EXPLODING = 3;    // Hit a shield or a bomb, or reached the top
+    const SHOT_DONE = 4;         // Ready to be removed
+    const SHOT_HIT_INVADER = 5;  // The invader it hit is exploding
+
+    // Shields and the line under the cannon
+    const SHIELD_X = [32, 77, 122, 167];
+    const SHIELD_Y = 192;
+    const LINE_Y = 239;
 
     // --- GRAPHICS ---
     // Transcribed from the ROM as hex, one byte per screen column from left to right, bit 7 at the top
@@ -158,6 +181,7 @@
     let score = 0;
     let highScore = loadHighScore();
     let ships = 0;
+    let extraShipAvailable = false;
 
     let alive = new Uint8Array(RACK_ROWS * RACK_COLS); // Index = row * 11 + column
     let numAliens = 0;
@@ -174,6 +198,11 @@
     let playerOK = false;   // False while the cannon is blowing up or waiting to reappear
     let enableAlienFire = false;
     let alienFireDelay = 0;
+
+    let shot = null;
+    let fireBounce = false; // Fire must be let go between shots
+    let shotCount = 0;      // Shots fired this rack
+    let invaderExplosion = { timer: 0, x: 0, y: 0 };
 
     // --- CONTROLS ---
     const keys = {};    // Keys held down
@@ -280,10 +309,25 @@
     function startGame() {
         mode = "playing";
         score = 0;
-        ships = 3;
+        ships = START_SHIPS;
+        extraShipAvailable = true;
         drawHud();
         newRack(RACK_FIRST_Y);
         tasksOn = true;
+    }
+
+    // Four digits that wrap past 9,999, as in the arcade
+    function addScore(points) {
+        if (mode !== "playing") return;
+        score = (score + points) % 10000;
+        drawScores();
+    }
+
+    function checkExtraShip() {
+        if (!extraShipAvailable || score < EXTRA_SHIP_POINTS) return;
+        extraShipAvailable = false;
+        ships++;
+        drawShips();
     }
 
     // Everything the arcade resets from its ROM copy at the start of a rack
@@ -303,6 +347,20 @@
         playerOK = true;
         enableAlienFire = false;
         alienFireDelay = ALIEN_FIRE_DELAY;
+        resetShot();
+        fireBounce = false;
+        shotCount = 0;
+        invaderExplosion.timer = 0;
+        drawShields();
+        drawBottomLine();
+    }
+
+    function drawShields() {
+        for (const x of SHIELD_X) writeSprite(SPR.shield, x, SHIELD_Y);
+    }
+
+    function drawBottomLine() {
+        screen.fill(1, LINE_Y * W, LINE_Y * W + W);
     }
 
     // --- PLAYER ---
@@ -330,6 +388,101 @@
         writeSprite(SPR.player, player.x, PLAYER_Y);
     }
 
+    // --- PLAYER SHOT ---
+    function resetShot() {
+        shot = {
+            status: SHOT_IDLE,
+            x: 0,
+            y: SHOT_START_Y,
+            sprite: SPR.playerShot,
+            timer: SHOT_EXPLOSION_FRAMES,
+            collided: false
+        };
+    }
+
+    // PlrFireOrDemo $1618. The button is only checked while no shot is on screen, so it has to be
+    // let go (and seen to be let go) between shots.
+    function playerFire() {
+        if (player.timer > 0 || shot.status !== SHOT_IDLE) return;
+        const down = keys["Space"] || pressed["Space"];
+        if (fireBounce) {
+            if (!down) fireBounce = false;
+        } else if (down) {
+            shot.status = SHOT_STARTING;
+            fireBounce = true;
+        }
+    }
+
+    // GameObj1 $03BB
+    function updatePlayerShot() {
+        switch (shot.status) {
+            case SHOT_STARTING:
+                shot.status = SHOT_MOVING;
+                shot.x = player.x + 8;
+                drawSprite(shot.sprite, shot.x, shot.y);
+                break;
+            case SHOT_MOVING:
+                eraseSprite(shot.sprite, shot.x, shot.y);
+                shot.y -= SHOT_SPEED;
+                shot.collided = drawSprite(shot.sprite, shot.x, shot.y);
+                break;
+            case SHOT_EXPLODING:
+                // The explosion replaces the shot, and erasing it later bites out whatever it covered
+                if (--shot.timer === 0) {
+                    endOfShot();
+                } else if (shot.timer === SHOT_EXPLOSION_FRAMES - 1) {
+                    eraseSprite(shot.sprite, shot.x, shot.y);
+                    shot.sprite = SPR.shotExplosion;
+                    shot.x -= 3;
+                    shot.y += 2;
+                    drawSprite(shot.sprite, shot.x, shot.y);
+                }
+                break;
+            case SHOT_DONE:
+                endOfShot();
+                break;
+        }
+    }
+
+    // EndOfBlowup $0436
+    function endOfShot() {
+        eraseSprite(shot.sprite, shot.x, shot.y);
+        resetShot();
+        shotCount++;
+    }
+
+    // PlayerShotHit $14D8: work out what the shot ran into from where it was
+    function playerShotHit() {
+        if (shot.status !== SHOT_MOVING) return;
+        if (shot.y <= SHOT_TOP_Y) {
+            shot.status = SHOT_EXPLODING;
+            return;
+        }
+        if (!shot.collided) return;
+        shot.collided = false;
+
+        // Below the rack it must be a shield or a bomb, unless the rack's bottom-left corner has
+        // dropped off the screen (with its top rows down in the shields)
+        if (refY <= 248 && shot.y >= refY + 6) {
+            shot.status = SHOT_EXPLODING;
+            return;
+        }
+        // Otherwise find the rack cell where it hit. As in the ROM, a shot just left of the rack
+        // counts as column 0, and column 11 runs on into the next row up.
+        const row = Math.ceil((refY - shot.y + 6) / 16) - 1;
+        const col = shot.x > refX ? Math.ceil((shot.x - refX) / 16) - 1 : 0;
+        const index = row * RACK_COLS + col;
+        if (index >= alive.length || !alive[index]) {
+            shot.status = SHOT_EXPLODING; // No invader there, so it hit a bomb
+            return;
+        }
+        alive[index] = 0;
+        addScore(INVADER_POINTS[row]);
+        invaderExplosion = { timer: INVADER_EXPLOSION_FRAMES, x: refX + col * 16, y: refY - row * 16 };
+        writeInvader(SPR.invaderExplosion, invaderExplosion.x, invaderExplosion.y);
+        shot.status = SHOT_HIT_INVADER;
+    }
+
     // --- INVADERS ---
     // The rack ripples: only one invader is redrawn per frame, so a full rack takes 55 frames to
     // move one step and the last invader moves every frame.
@@ -348,8 +501,15 @@
         writeSprite(spr, x, y);
     }
 
-    // DrawAlien $0100
+    // DrawAlien $0100. While a hit invader explodes, the rack stands still.
     function drawInvader() {
+        if (invaderExplosion.timer > 0) {
+            if (--invaderExplosion.timer === 0) {
+                clearRect(invaderExplosion.x, invaderExplosion.y - 8, 16, 16);
+                shot.status = SHOT_DONE;
+            }
+            return;
+        }
         if (!waitOnDraw) return;
         if (alive[cursor]) {
             const type = Math.floor(cursor / RACK_COLS) >> 1; // Octopus, crab, crab... from the bottom row up
@@ -409,9 +569,13 @@
     function runGameTasks() {
         drawInvader();
         updatePlayer();
+        updatePlayerShot();
         advanceCursor();
+        playerFire();
+        playerShotHit();
         rackBump();
         countInvaders();
+        checkExtraShip();
     }
 
     function step() {
